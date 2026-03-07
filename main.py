@@ -1,148 +1,147 @@
+"""
+Text Analyzer API
+Run:  uvicorn main:app --reload
+Docs: http://localhost:8000/docs
+"""
+
 import os
-import sys
 import json
-import argparse
 import requests
 from dotenv import load_dotenv
 
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from pydantic import BaseModel, Field
+
 load_dotenv()
 
-API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = os.getenv("OPENROUTER_MODEL")
-API_URL = os.getenv("OPENROUTER_URL")
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
+app = FastAPI(
+    title="📝 Text Analyzer",
+    description="""
+Summarizes text, extracts **action items** and **key decisions**.
 
-def read_file_dynamic(path):
-    """
-    Attempt to read any file containing text using multiple encodings.
-    """
-    encodings = ["utf-8", "latin-1", "utf-16"]
+| Endpoint | Use |
+|---|---|
+| `POST /analyze/text` | Paste text directly |
+| `POST /analyze/file` | Upload a text file |
+""",
+    version="1.0.0",
+)
 
-    for enc in encodings:
-        try:
-            with open(path, "r", encoding=enc) as f:
-                return f.read()
-        except Exception:
-            continue
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
-    raise ValueError(f"Could not read file as text: {path}")
+class TextInput(BaseModel):
+    text: str = Field(
+        ...,
+        min_length=10,
+        description="The text you want to analyze",
+        json_schema_extra={
+            "example": (
+                "The team reviewed Q3 results. Revenue dropped 12%. "
+                "The CEO decided to cut marketing spend by 20%. "
+                "John will prepare a revised forecast by Friday. "
+                "Sarah will lead the cost-reduction task force."
+            )
+        },
+    )
 
+class AnalysisResult(BaseModel):
+    summary: str
+    actions: list[str]
+    decisions: list[str]
 
-def read_input(input_source=None):
-    """
-    Read input dynamically from:
-    - Any file containing text
-    - stdin
-    - direct text input
-    """
+# ---------------------------------------------------------------------------
+# Core — single function, does everything
+# ---------------------------------------------------------------------------
 
-    if input_source and os.path.exists(input_source):
-        return read_file_dynamic(input_source)
+def analyze(text: str) -> AnalysisResult:
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is empty.")
 
-    if not sys.stdin.isatty():
-        return sys.stdin.read()
-
-    if input_source:
-        return input_source
-
-    raise ValueError("No input provided.")
-
-
-def call_llm(text):
-    """
-    Call OpenRouter Nemotron model
-    """
-
-    prompt = f"""
-Extract structured information from the following text.
-
-Return ONLY valid JSON with keys:
-summary: concise summary (2-5 sentences)
-actions: list of action items
-decisions: list of decisions
-
-Rules:
-- Actions must be actionable tasks
-- Decisions must represent conclusions or choices
-- Deduplicate similar items
-- Each item must be short (1 line)
+    try:
+        response = requests.post(
+            os.environ["OPENROUTER_URL"],
+            headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+            json={
+                "model": os.environ["OPENROUTER_MODEL"],
+                "temperature": 0,
+                "messages": [{
+                    "role": "user",
+                    "content": f"""Analyze the text below. Return ONLY valid JSON with these keys:
+- "summary": 2-5 sentence summary
+- "actions": list of actionable tasks
+- "decisions": list of key decisions or conclusions
 
 TEXT:
-{text}
-"""
-
-    response = requests.post(
-        API_URL,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": MODEL,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0
-        }
-    )
-
-    if response.status_code == 429:
-        raise Exception("Rate limit exceeded. Wait a few minutes and try again.")
-    
-    response.raise_for_status()
-
-    data = response.json()
-
-    return data["choices"][0]["message"]["content"]
-
-
-def parse_response(text):
-    """
-    Safely parse model response
-    """
+{text}"""
+                }]
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=503, detail="Cannot reach LLM. Check OPENROUTER_URL.")
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="LLM request timed out.")
+    except requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
     try:
-        data = json.loads(text)
-
-        actions = list(set(data.get("actions", [])))
-        decisions = list(set(data.get("decisions", [])))
-
-        return {
-            "summary": data.get("summary", ""),
-            "actions": actions,
-            "decisions": decisions
-        }
-
-    except Exception:
-        return {
-            "summary": "",
-            "actions": [],
-            "decisions": []
-        }
-
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description="Dynamic Text Processor"
-    )
-
-    parser.add_argument(
-        "--input",
-        help="File path OR raw text input"
-    )
-
-    args = parser.parse_args()
-
-    try:
-        text = read_input(args.input)
-        response = call_llm(text)
-        result = parse_response(response)
-        print(json.dumps(result, indent=2))
+        raw = response.json()["choices"][0]["message"]["content"]
+        clean = raw.strip().strip("```json").strip("```").strip()
+        data = json.loads(clean)
+        return AnalysisResult(
+            summary=data.get("summary", ""),
+            actions=data.get("actions", []),
+            decisions=data.get("decisions", []),
+        )
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise HTTPException(status_code=500, detail=f"Failed to parse LLM response: {e}")
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+
+@app.post(
+    "/analyze/plain",
+    response_model=AnalysisResult,
+    tags=["Analyze"],
+    summary="📝 Plain text (no JSON)",
+)
+async def analyze_plain(text: str = Body(..., media_type="text/plain")):
+    return analyze(text)
+
+
+@app.post(
+    "/analyze/file",
+    response_model=AnalysisResult,
+    tags=["Analyze"],
+    summary="📁 Upload a text file",
+    description="Upload any plain text file (`.txt`, `.md`, `.log`, `.csv`, etc.)",
+)
+async def analyze_file(file: UploadFile = File(..., description="Any plain text file")):
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="File is empty.")
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        raise HTTPException(status_code=422, detail="Could not decode file.")
+    return analyze(text)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
