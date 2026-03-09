@@ -10,9 +10,13 @@ import requests
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 load_dotenv()
+
+# Read timeout from .env so it can be tuned per environment without touching code.
+# e.g. LLM_TIMEOUT=60 for large models, LLM_TIMEOUT=15 for fast/small ones.
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "30"))
 
 # ---------------------------------------------------------------------------
 # App
@@ -21,42 +25,75 @@ load_dotenv()
 app = FastAPI(
     title="📝 Text Analyzer",
     description="""
-Summarizes text, extracts **action items** and **key decisions**.
 
-| Endpoint | Use |
-|---|---|
-| `POST /analyze/text` | Paste text directly |
-| `POST /analyze/file` | Upload a text file |
 """,
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # ---------------------------------------------------------------------------
-# Models
+# Model
 # ---------------------------------------------------------------------------
-
-class TextInput(BaseModel):
-    text: str = Field(
-        ...,
-        min_length=10,
-        description="The text you want to analyze",
-        json_schema_extra={
-            "example": (
-                "The team reviewed Q3 results. Revenue dropped 12%. "
-                "The CEO decided to cut marketing spend by 20%. "
-                "John will prepare a revised forecast by Friday. "
-                "Sarah will lead the cost-reduction task force."
-            )
-        },
-    )
 
 class AnalysisResult(BaseModel):
     summary: str
-    actions: list[str]
-    decisions: list[str]
+    action_items: list[str]
+    risks: list[str]
+    priority_tasks: list[str]
 
 # ---------------------------------------------------------------------------
-# Core — single function, does everything
+# Prompt
+# ---------------------------------------------------------------------------
+
+PROMPT = """Analyze the TEXT below and return ONLY a valid JSON object with exactly these four keys:
+
+{{
+  "summary": "",
+  "action_items": [],
+  "risks": [],
+  "priority_tasks": []
+}}
+
+RULES FOR EACH FIELD
+
+summary
+  - 2-5 sentences describing the core topic and outcome.
+  - Return "" if text is under 15 words, blank, or makes no sense.
+
+action_items
+  - Only tasks or assignments that are clearly and explicitly stated in the text.
+  - Do not infer, assume, or invent anything not directly written.
+  - Return [] if none found.
+
+risks
+  - Threats, blockers, or concerns that are stated or directly implied in the text.
+  - Do not fabricate risks that have no basis in the text.
+  - Return [] if none found.
+
+priority_tasks
+  - The most urgent items taken only from action_items — no new tasks.
+  - Order by: explicit deadline first, then impact, then risk.
+  - Return [] if action_items is [].
+
+CORNER CASES
+  - Text under 15 words or blank   → summary="", all three arrays []
+  - No tasks in text               → action_items=[], priority_tasks=[]
+  - No risks in text               → risks=[]
+  - Duplicate tasks                → keep only the most specific one
+  - Emotional or narrative text    → fill summary, leave arrays [] unless tasks/risks are present
+  - Noisy or garbled text          → extract what is clearly readable, skip the rest
+  - Non-English text               → respond in the same language as the input
+
+BEFORE RETURNING check:
+  - Valid JSON only — no markdown fences, no explanation, no extra keys
+  - priority_tasks must be a subset of action_items
+  - Nothing invented — every item must come directly from the text
+  - Empty fields are [] or "" never null
+
+TEXT:
+{text}"""
+
+# ---------------------------------------------------------------------------
+# Core
 # ---------------------------------------------------------------------------
 
 def analyze(text: str) -> AnalysisResult:
@@ -71,35 +108,31 @@ def analyze(text: str) -> AnalysisResult:
             json={
                 "model": os.environ["OPENROUTER_MODEL"],
                 "temperature": 0,
-                "messages": [{
-                    "role": "user",
-                    "content": f"""Analyze the text below. Return ONLY valid JSON with these keys:
-- "summary": 2-5 sentence summary
-- "actions": list of actionable tasks
-- "decisions": list of key decisions or conclusions
-
-TEXT:
-{text}"""
-                }]
+                "messages": [{"role": "user", "content": PROMPT.format(text=text)}],
             },
-            timeout=45,
+            timeout=LLM_TIMEOUT,
         )
         response.raise_for_status()
     except requests.exceptions.ConnectionError:
         raise HTTPException(status_code=503, detail="Cannot reach LLM. Check OPENROUTER_URL.")
     except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="LLM request timed out.")
+        raise HTTPException(status_code=504, detail=f"LLM did not respond within {LLM_TIMEOUT}s. Increase LLM_TIMEOUT in .env.")
     except requests.exceptions.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
     try:
         raw = response.json()["choices"][0]["message"]["content"]
-        clean = raw.strip().strip("```json").strip("```").strip()
+        # Isolate the outermost { ... } to handle any stray prose the model adds
+        clean = raw.strip()
+        start, end = clean.find("{"), clean.rfind("}")
+        if start != -1 and end > start:
+            clean = clean[start: end + 1]
         data = json.loads(clean)
         return AnalysisResult(
             summary=data.get("summary", ""),
-            actions=data.get("actions", []),
-            decisions=data.get("decisions", []),
+            action_items=data.get("action_items", []),
+            risks=data.get("risks", []),
+            priority_tasks=data.get("priority_tasks", []),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse LLM response: {e}")
@@ -107,8 +140,6 @@ TEXT:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-
-
 
 @app.post(
     "/analyze/plain",
@@ -131,11 +162,7 @@ async def analyze_file(file: UploadFile = File(..., description="Any plain text 
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="File is empty.")
-    try:
-        text = raw.decode("utf-8", errors="ignore")
-    except Exception:
-        raise HTTPException(status_code=422, detail="Could not decode file.")
-    return analyze(text)
+    return analyze(raw.decode("utf-8", errors="ignore"))
 
 
 # ---------------------------------------------------------------------------
