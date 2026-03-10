@@ -1,0 +1,180 @@
+"""
+RAG QA API — LangChain + OpenAI + FAISS
+Supports: .txt, .md, .log, .csv
+
+Run:
+  pip install -r requirements.txt
+  cp .env.example .env   # fill in your key
+  uvicorn ai_task_prompt:app --reload
+"""
+
+from dotenv import load_dotenv
+load_dotenv()  # ← must be before all other imports
+
+import os
+import json
+import pandas as pd
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
+
+from prompts import CONTEXT_QA_PROMPT
+
+
+# ─────────────────────────────────────────────
+# CONFIG FROM ENV
+# ─────────────────────────────────────────────
+
+OPENAI_MODEL           = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+CHUNK_SIZE             = int(os.getenv("CHUNK_SIZE", 800))
+CHUNK_OVERLAP          = int(os.getenv("CHUNK_OVERLAP", 150))
+DEFAULT_TOP_K          = int(os.getenv("TOP_K", 4))
+
+SUPPORTED = {".txt", ".md", ".log", ".csv"}
+
+# ─────────────────────────────────────────────
+# APP + MODEL SETUP
+# ─────────────────────────────────────────────
+
+app = FastAPI(title="RAG QA API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+vector_db = None
+uploaded_sources: list[str] = []
+
+llm        = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+embeddings = OpenAIEmbeddings(model=OPENAI_EMBEDDING_MODEL)
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
+def load_file(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in SUPPORTED:
+        raise ValueError(f"Unsupported format '{ext}'. Allowed: {', '.join(SUPPORTED)}")
+    if ext == ".csv":
+        return pd.read_csv(path).to_string(index=False)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+def chunk_text(text: str) -> list[str]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+    return splitter.split_text(text)
+
+def parse_llm_json(raw: str) -> dict:
+    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(cleaned)
+
+# ─────────────────────────────────────────────
+# SCHEMAS
+# ─────────────────────────────────────────────
+
+class AskRequest(BaseModel):
+    question: str
+    top_k: int = DEFAULT_TOP_K
+
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    global vector_db
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in SUPPORTED:
+        raise HTTPException(422, f"Unsupported format '{ext}'. Allowed: {', '.join(SUPPORTED)}")
+
+    temp_path = f"temp_{file.filename}"
+    with open(temp_path, "wb") as f:
+        f.write(await file.read())
+
+    try:
+        text = load_file(temp_path)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    finally:
+        os.remove(temp_path)
+
+    if not text.strip():
+        raise HTTPException(400, "File is empty.")
+
+    chunks = chunk_text(text)
+
+    new_db = FAISS.from_texts(chunks, embeddings)
+    if vector_db is None:
+        vector_db = new_db
+    else:
+        vector_db.merge_from(new_db)
+
+    uploaded_sources.append(file.filename)
+
+    return {
+        "status": "success",
+        "filename": file.filename,
+        "chunks_created": len(chunks),
+        "total_sources": len(uploaded_sources),
+    }
+
+
+@app.post("/ask")
+async def ask(req: AskRequest):
+    if vector_db is None:
+        return {"answer": "Not in context", "confidence": 0, "source_snippets": []}
+
+    docs = vector_db.similarity_search(req.question, k=req.top_k)
+
+    if not docs:
+        return {"answer": "Not in context", "confidence": 0, "source_snippets": []}
+
+    context = "\n\n".join(d.page_content for d in docs)
+    prompt  = CONTEXT_QA_PROMPT.format(context=context, question=req.question)
+
+    response = llm.invoke(prompt)
+
+    try:
+        parsed = parse_llm_json(response.content)
+    except json.JSONDecodeError:
+        raise HTTPException(500, f"Model returned non-JSON: {response.content[:200]}")
+
+    return {
+        "question":        req.question,
+        "answer":          parsed.get("answer", "Not in context"),
+        "confidence":      parsed.get("confidence", 0),
+        "source_snippets": parsed.get("source_snippets", []),
+        "warning":         parsed.get("warning"),
+    }
+
+
+@app.get("/stats")
+def stats():
+    return {
+        "total_sources": len(uploaded_sources),
+        "sources":       uploaded_sources,
+        "index_ready":   vector_db is not None,
+        "config": {
+            "model":            OPENAI_MODEL,
+            "embedding_model":  OPENAI_EMBEDDING_MODEL,
+            "chunk_size":       CHUNK_SIZE,
+            "chunk_overlap":    CHUNK_OVERLAP,
+            "default_top_k":    DEFAULT_TOP_K,
+        }
+    }
+
+
+@app.delete("/clear")
+def clear():
+    global vector_db
+    vector_db = None
+    uploaded_sources.clear()
+    return {"status": "cleared"}
