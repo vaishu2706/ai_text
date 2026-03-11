@@ -1,6 +1,6 @@
 """
 RAG QA API — LangChain + OpenAI + FAISS
-Supports: .txt, .md, .log, .csv
+Supports: .txt, .md, .log, .csv, .pdf
 
 Run:
   pip install -r requirements.txt
@@ -23,6 +23,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 
+from pypdf import PdfReader
+
 from prompts import CONTEXT_QA_PROMPT
 
 
@@ -36,7 +38,7 @@ CHUNK_SIZE             = int(os.getenv("CHUNK_SIZE", 800))
 CHUNK_OVERLAP          = int(os.getenv("CHUNK_OVERLAP", 150))
 DEFAULT_TOP_K          = int(os.getenv("TOP_K", 4))
 
-SUPPORTED = {".txt", ".md", ".log", ".csv"}
+SUPPORTED = {".txt", ".md", ".log", ".csv", ".pdf"}
 
 # ─────────────────────────────────────────────
 # APP + MODEL SETUP
@@ -61,6 +63,20 @@ def load_file(path: str) -> str:
         raise ValueError(f"Unsupported format '{ext}'. Allowed: {', '.join(SUPPORTED)}")
     if ext == ".csv":
         return pd.read_csv(path).to_string(index=False)
+    if ext == ".pdf":
+        reader = PdfReader(path)
+        pages_text = []
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text() or ""
+            if text.strip():
+                pages_text.append(text)
+        if not pages_text:
+            raise ValueError(
+                "No text could be extracted from this PDF. "
+                "It may be a scanned/image-based PDF. "
+                "OCR support is required for such files."
+            )
+        return "\n\n".join(pages_text)
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
